@@ -117,7 +117,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 hooked = true;
                 Log.i(TAG, "Hooked UdfpsController.Callback impl: " + candidate.getName());
                 break;
-            } catch (NoSuchMethodException | ClassNotFoundException ignored) {
+            } catch (NoSuchMethodException | XposedHelpers.ClassNotFoundError ignored) {
                 // not this inner class
             }
         }
