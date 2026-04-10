@@ -2,7 +2,7 @@ package com.mrx7014.s25ultraspoofer;
  
 import android.text.TextUtils;
 import android.util.Log;
- 
+import java.util.Set;
 import java.lang.reflect.Method;
 import java.util.Arrays;
  
@@ -176,43 +176,44 @@ public class MainHook implements IXposedHookLoadPackage {
     // RUNS IN: system_server (package "android")
     // -----------------------------------------------------------------------
     private void hookAuthService(ClassLoader cl) {
-        try {
-            Class<?> cls = XposedHelpers.findClass(CLS_AUTH_SERVICE, cl);
-            int count = XposedBridge.hookAllMethods(cls, "getUdfpsProps",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                String fpLocation = sysPropGet(
-                                        "persist.vendor.fingerprint.optical.sensorlocation", "");
-                                if (TextUtils.isEmpty(fpLocation) || !fpLocation.contains("::"))
-                                    return;
- 
-                                String[] coords = fpLocation.split("::");
-                                if (coords.length < 2) return;
- 
-                                int x = Integer.parseInt(coords[0].trim());
-                                int y = Integer.parseInt(coords[1].trim());
- 
-                                String iconSizeStr = sysPropGet(
-                                        "persist.vendor.fingerprint.optical.iconsize", "0");
-                                int radius = Integer.parseInt(iconSizeStr.trim()) / 2;
- 
-                                int[] udfpsProps = {x, y, radius};
-                                Log.d(TAG, "Oplus UDFPS props: " + Arrays.toString(udfpsProps));
-                                param.setResult(udfpsProps);
-                            } catch (Throwable t) {
-                                Log.e(TAG, "getUdfpsProps hook error", t);
-                            }
+    try {
+        Class<?> cls = XposedHelpers.findClass(CLS_AUTH_SERVICE, cl);
+        Set<XC_MethodHook.Unhook> hooks = XposedBridge.hookAllMethods(cls, "getUdfpsProps",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            String fpLocation = sysPropGet(
+                                    "persist.vendor.fingerprint.optical.sensorlocation", "");
+                            if (TextUtils.isEmpty(fpLocation) || !fpLocation.contains("::"))
+                                return;
+
+                            String[] coords = fpLocation.split("::");
+                            if (coords.length < 2) return;
+
+                            int x = Integer.parseInt(coords[0].trim());
+                            int y = Integer.parseInt(coords[1].trim());
+
+                            String iconSizeStr = sysPropGet(
+                                    "persist.vendor.fingerprint.optical.iconsize", "0");
+                            int radius = Integer.parseInt(iconSizeStr.trim()) / 2;
+
+                            int[] udfpsProps = {x, y, radius};
+                            Log.d(TAG, "Oplus UDFPS props: " + Arrays.toString(udfpsProps));
+                            param.setResult(udfpsProps);
+                        } catch (Throwable t) {
+                            Log.e(TAG, "getUdfpsProps hook error", t);
                         }
-                    });
-            Log.i(TAG, "Hooked AuthService#getUdfpsProps (" + count + " methods)");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            Log.e(TAG, "AuthService not found – add 'android' to module scope!", e);
-        } catch (Throwable t) {
-            Log.e(TAG, "Failed to hook AuthService", t);
-        }
+                    }
+                });
+        Log.i(TAG, "Hooked AuthService#getUdfpsProps (" + hooks.size() + " methods)");
+    } catch (XposedHelpers.ClassNotFoundError e) {
+        Log.e(TAG, "AuthService not found – add 'android' to module scope!", e);
+    } catch (Throwable t) {
+        Log.e(TAG, "Failed to hook AuthService", t);
     }
+}
+
  
     // -----------------------------------------------------------------------
     // 3. FingerprintProvider – force TYPE_UDFPS_OPTICAL when sensorLocationX > 0
@@ -223,47 +224,47 @@ public class MainHook implements IXposedHookLoadPackage {
     // RUNS IN: system_server (package "android")
     // -----------------------------------------------------------------------
     private void hookFingerprintProvider(ClassLoader cl) {
-        try {
-            Class<?> cls = XposedHelpers.findClass(CLS_FP_PROVIDER, cl);
-            int count = XposedBridge.hookAllMethods(cls, "addSensor",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                Object prop = null;
-                                for (Object arg : param.args) {
-                                    if (arg != null && arg.getClass().getName()
-                                            .equals(CLS_FP_SENSOR_PROPS)) {
-                                        prop = arg;
-                                        break;
-                                    }
+    try {
+        Class<?> cls = XposedHelpers.findClass(CLS_FP_PROVIDER, cl);
+        Set<XC_MethodHook.Unhook> hooks = XposedBridge.hookAllMethods(cls, "addSensor",
+                new XC_MethodHook() {
+                    @Override
+                    protected void beforeHookedMethod(MethodHookParam param) {
+                        try {
+                            Object prop = null;
+                            for (Object arg : param.args) {
+                                if (arg != null && arg.getClass().getName()
+                                        .equals(CLS_FP_SENSOR_PROPS)) {
+                                    prop = arg;
+                                    break;
                                 }
-                                if (prop == null) return;
- 
-                                Object[] sensorLocations = (Object[])
-                                        XposedHelpers.getObjectField(prop, "sensorLocations");
-                                if (sensorLocations == null || sensorLocations.length != 1)
-                                    return;
- 
-                                int sensorLocationX = XposedHelpers.getIntField(
-                                        sensorLocations[0], "sensorLocationX");
-                                if (sensorLocationX <= 0) return;
- 
-                                Log.e(TAG, "Set fingerprint sensor type UDFPS Optical"
-                                        + " (sensorLocationX=" + sensorLocationX + ")");
-                                XposedHelpers.setIntField(prop, "sensorType", TYPE_UDFPS_OPTICAL);
-                                XposedHelpers.setBooleanField(
-                                        prop, "halHandlesDisplayTouches", true);
-                            } catch (Throwable t) {
-                                Log.e(TAG, "addSensor hook error", t);
                             }
+                            if (prop == null) return;
+
+                            Object[] sensorLocations = (Object[])
+                                    XposedHelpers.getObjectField(prop, "sensorLocations");
+                            if (sensorLocations == null || sensorLocations.length != 1)
+                                return;
+
+                            int sensorLocationX = XposedHelpers.getIntField(
+                                    sensorLocations[0], "sensorLocationX");
+                            if (sensorLocationX <= 0) return;
+
+                            Log.e(TAG, "Set fingerprint sensor type UDFPS Optical"
+                                    + " (sensorLocationX=" + sensorLocationX + ")");
+                            XposedHelpers.setIntField(prop, "sensorType", TYPE_UDFPS_OPTICAL);
+                            XposedHelpers.setBooleanField(
+                                    prop, "halHandlesDisplayTouches", true);
+                        } catch (Throwable t) {
+                            Log.e(TAG, "addSensor hook error", t);
                         }
-                    });
-            Log.i(TAG, "Hooked FingerprintProvider#addSensor (" + count + " methods)");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            Log.e(TAG, "FingerprintProvider not found – add 'android' to module scope!", e);
-        } catch (Throwable t) {
-            Log.e(TAG, "Failed to hook FingerprintProvider", t);
-        }
+                    }
+                });
+        Log.i(TAG, "Hooked FingerprintProvider#addSensor (" + hooks.size() + " methods)");
+    } catch (XposedHelpers.ClassNotFoundError e) {
+        Log.e(TAG, "FingerprintProvider not found – add 'android' to module scope!", e);
+    } catch (Throwable t) {
+        Log.e(TAG, "Failed to hook FingerprintProvider", t);
     }
+}
 }
