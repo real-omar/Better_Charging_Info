@@ -3,11 +3,11 @@ plugins {
 }
 
 android {
-    namespace 'com.mrx7014.s25ultraspoofer'
+    namespace 'com.omar.vooc_info'
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.mrx7014.s25ultraspoofer"
+        applicationId "com.omar.vooc_info"
         minSdk 29
         targetSdk 34
         versionCode 1
