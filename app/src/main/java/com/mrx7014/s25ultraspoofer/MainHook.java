@@ -1,506 +1,375 @@
 package com.mrx7014.s25ultraspoofer;
 
-import android.text.TextUtils;
+import android.content.Intent;
+import android.content.res.Resources;
+import android.os.Bundle;
 import android.util.Log;
 
+import java.io.BufferedReader;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.IOException;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
-import java.util.Arrays;
-import java.util.Set;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
-import de.robv.android.xposed.IXposedHookZygoteInit;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.XposedHelpers;
 import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 /**
- * LSPosed module — Oplus/OPPO UDFPS fix.
+ * LSPosed module that backports VOOC fast-charging support to GSI / AOSP ROMs.
  *
- * STATUS FROM LOGS:
- *   ✅ UdfpsController.onFingerDown/Up hooks fire (SystemUI)
- *   ✅ sys.phh.oplus.fppress → sysfs bridge works
- *   ✅ UdfpsControllerOverlay layer exists (SF side is ok)
- *   ❌ FingerprintCallback.sendUdfpsPointerDown/Up callback null
- *   ❌ UdfpsDisplayMode.onDisabled is null
- *   ❌ Zero system_server hook output → "android" NOT in module scope
+ * What the original patch does (summarised):
+ *  1. BatteryService reads /sys/class/power_supply/battery/voocchg_ing and
+ *     injects "vooc_charger" = true into ACTION_BATTERY_CHANGED when the node
+ *     reads "1".
+ *  2. BatteryStatus.getChargingSpeed() returns CHARGING_VOOC (3) when
+ *     voocChargeStatus is true.
+ *  3. KeyguardIndicationController shows "VOOC Charging" text on the lock
+ *     screen for CHARGING_VOOC.
  *
- * ROOT CAUSE: "android" (system_server) is not in xposed_scope.
- * None of the AuthService / FingerprintCallback / Fingerprint21 hooks
- * ever run. Fix: add "android" to your scope array in arrays.xml.
- *
- * This version also fixes UdfpsDisplayMode.onDisabled being null,
- * which is a SystemUI-side issue we CAN fix without system_server scope.
- *
- * REQUIRED xposed_scope entries:
- *   <item>com.android.systemui</item>
- *   <item>android</item>   ← THIS IS THE MISSING ONE
+ * All three behaviours are replicated here via hooks, so no framework source
+ * changes or custom ROM are required.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
-    private static final String TAG = "PHH-OplusUdfpsFix";
+    private static final String TAG = "VoocChargerHook";
 
-    private static final String PKG_SYSTEMUI = "com.android.systemui";
-    private static final String PKG_SYSTEM   = "android";
+    // Path to the kernel sysfs node that signals VOOC charging
+    private static final String VOOC_NODE = "/sys/class/power_supply/battery/voocchg_ing";
 
-    // SystemUI
-    private static final String CLS_UDFPS_CONTROLLER =
-            "com.android.systemui.biometrics.UdfpsController";
-    private static final String CLS_AUTH_CONTROLLER =
-            "com.android.systemui.biometrics.AuthController";
-    private static final String CLS_UDFPS_DISPLAY_MODE =
-            "com.android.systemui.biometrics.UdfpsDisplayMode";
+    // Extra key added by the patch to ACTION_BATTERY_CHANGED
+    private static final String EXTRA_VOOC_CHARGER = "vooc_charger";
 
-    // system_server – AIDL
-    private static final String CLS_AUTH_SERVICE =
-            "com.android.server.biometrics.AuthService";
-    private static final String CLS_FP_PROVIDER =
-            "com.android.server.biometrics.sensors.fingerprint.aidl.FingerprintProvider";
-    private static final String CLS_FP_SENSOR_PROPS =
-            "android.hardware.fingerprint.FingerprintSensorPropertiesInternal";
-
-    // system_server – HIDL
-    private static final String CLS_FINGERPRINT_CALLBACK =
-            "com.android.server.biometrics.sensors.fingerprint.hidl.FingerprintCallback";
-    private static final String CLS_FINGERPRINT21 =
-            "com.android.server.biometrics.sensors.fingerprint.hidl.Fingerprint21";
-    private static final String CLS_FINGERPRINT21_UDFPS =
-            "com.android.server.biometrics.sensors.fingerprint.hidl.Fingerprint21UdfpsMock";
-    private static final String CLS_HIDL_TO_AIDL =
-            "com.android.server.biometrics.sensors.fingerprint.hidl.HidlToAidlSessionAdapter";
-
-    private static final int TYPE_UDFPS_OPTICAL = 3;
+    // BatteryStatus charging speed constant added by the patch
+    private static final int CHARGING_VOOC = 3;
 
     // -----------------------------------------------------------------------
-    // SystemProperties via reflection
+    // Entry point
     // -----------------------------------------------------------------------
-    private static String sysPropGet(String key, String def) {
-        try {
-            Class<?> sp = Class.forName("android.os.SystemProperties");
-            return (String) sp.getMethod("get", String.class, String.class)
-                    .invoke(null, key, def);
-        } catch (Throwable t) {
-            Log.e(TAG, "sysPropGet failed: " + key, t);
-            return def;
-        }
-    }
 
-    private static void sysPropSet(String key, String value) {
-        try {
-            Class<?> sp = Class.forName("android.os.SystemProperties");
-            sp.getMethod("set", String.class, String.class).invoke(null, key, value);
-        } catch (Throwable t) {
-            Log.e(TAG, "sysPropSet failed: " + key + "=" + value, t);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Entry point — log EVERY package we're called for so we can verify scope
-    // -----------------------------------------------------------------------
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
-        // Log every single package load so we can confirm scope in logcat.
-        // Look for "PHH-OplusUdfpsFix: loaded into: android" to confirm
-        // system_server is in scope. If you never see it, add "android" to
-        // your xposed_scope array in res/values/arrays.xml.
-        Log.i(TAG, "loaded into: " + lpparam.packageName);
+        switch (lpparam.packageName) {
+            case "android":
+                // BatteryService lives in the system_server process whose
+                // package name is reported as "android".
+                hookBatteryService(lpparam.classLoader);
+                hookBatteryStatus(lpparam.classLoader);
+                break;
 
-        if (PKG_SYSTEMUI.equals(lpparam.packageName)) {
-            hookUdfpsController(lpparam.classLoader);
-            hookUdfpsDisplayMode(lpparam.classLoader);
-        } else if (PKG_SYSTEM.equals(lpparam.packageName)) {
-            Log.i(TAG, ">>> system_server scope confirmed <<<");
-            hookAuthService(lpparam.classLoader);
-            hookFingerprintCallback(lpparam.classLoader);
-            hookFingerprint21(lpparam.classLoader);
-            hookFingerprintProviderAidl(lpparam.classLoader);
-            hookHidlToAidlAdapter(lpparam.classLoader);
+            case "com.android.systemui":
+                hookKeyguardIndicationController(lpparam.classLoader);
+                hookKeyguardUpdateMonitor(lpparam.classLoader);
+                break;
         }
     }
 
     // -----------------------------------------------------------------------
-    // SystemUI: UdfpsController finger events → sys.phh.oplus.fppress
-    // Already confirmed working. Kept unchanged.
+    // 1. BatteryService — inject vooc_charger into ACTION_BATTERY_CHANGED
     // -----------------------------------------------------------------------
-    private void hookUdfpsController(ClassLoader cl) {
+
+    /**
+     * Hook BatteryService.sendBatteryChangedIntentLocked() (or the equivalent
+     * method that builds / broadcasts ACTION_BATTERY_CHANGED).
+     *
+     * The exact method name varies slightly between Android versions:
+     *   - Android R/S: sendBatteryChangedIntentLocked
+     *   - Some builds:  broadcastBatteryStatsLocked / sendIntentLocked
+     *
+     * We hook the method that calls intent.putExtra(...) for battery fields and
+     * inject our own extra right after.
+     */
+    private void hookBatteryService(ClassLoader cl) {
         try {
-            Class<?> cls = XposedHelpers.findClass(CLS_UDFPS_CONTROLLER, cl);
-            XposedBridge.hookAllMethods(cls, "onFingerDown", new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    sysPropSet("sys.phh.oplus.fppress", "1");
-                    Log.d(TAG, "UdfpsController.onFingerDown → fppress=1");
-                }
-            });
-            XposedBridge.hookAllMethods(cls, "onFingerUp", new XC_MethodHook() {
-                @Override protected void beforeHookedMethod(MethodHookParam param) {
-                    sysPropSet("sys.phh.oplus.fppress", "0");
-                    Log.d(TAG, "UdfpsController.onFingerUp → fppress=0");
-                }
-            });
-            Log.i(TAG, "Hooked UdfpsController");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            try {
-                Class<?> cls = XposedHelpers.findClass(CLS_AUTH_CONTROLLER, cl);
-                XposedBridge.hookAllMethods(cls, "onUdfpsPointerDown", new XC_MethodHook() {
-                    @Override protected void beforeHookedMethod(MethodHookParam param) {
-                        sysPropSet("sys.phh.oplus.fppress", "1");
-                    }
-                });
-                XposedBridge.hookAllMethods(cls, "onUdfpsPointerUp", new XC_MethodHook() {
-                    @Override protected void beforeHookedMethod(MethodHookParam param) {
-                        sysPropSet("sys.phh.oplus.fppress", "0");
-                    }
-                });
-                Log.i(TAG, "Hooked AuthController (fallback)");
-            } catch (XposedHelpers.ClassNotFoundError e2) {
-                Log.e(TAG, "All SystemUI UdfpsController hooks failed");
-            }
-        }
-    }
+            Class<?> batteryServiceClass =
+                    XposedHelpers.findClass("com.android.server.BatteryService", cl);
 
-    // -----------------------------------------------------------------------
-    // SystemUI: UdfpsDisplayMode
-    //
-    // Log shows: "UdfpsDisplayMode: disable | onDisabled is null"
-    // UdfpsDisplayMode manages the display brightness/refresh during UDFPS.
-    // onDisabled being null means the callback was never registered, likely
-    // because the HIDL HAL path skips registering it.
-    //
-    // We hook enable() and disable() to log what's happening and ensure
-    // the display mode changes actually complete even with a null callback.
-    // -----------------------------------------------------------------------
-    private void hookUdfpsDisplayMode(ClassLoader cl) {
-        try {
-            Class<?> cls = XposedHelpers.findClass(CLS_UDFPS_DISPLAY_MODE, cl);
-
-            // Hook disable() — the null onDisabled means the mode is never
-            // properly torn down, which can leave the display in a wrong state.
-            XposedBridge.hookAllMethods(cls, "disable", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    Log.d(TAG, "UdfpsDisplayMode.disable() called");
-                    // Check if onDisabled callback is null and log the field
-                    try {
-                        dumpObjectFields(param.thisObject, "UdfpsDisplayMode");
-                    } catch (Throwable ignored) {}
-                }
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    // If onDisabled was null, manually try to reset display state
-                    // by finding and calling any available reset/restore method
-                    try {
-                        Object onDisabled = null;
-                        for (Field f : param.thisObject.getClass().getDeclaredFields()) {
-                            if (f.getName().contains("onDisabled")
-                                    || f.getName().contains("mOnDisabled")
-                                    || f.getName().contains("callback")) {
-                                f.setAccessible(true);
-                                onDisabled = f.get(param.thisObject);
-                                Log.i(TAG, "UdfpsDisplayMode field " + f.getName()
-                                        + " = " + (onDisabled == null ? "NULL" : onDisabled));
-                                break;
-                            }
-                        }
-                    } catch (Throwable t) {
-                        Log.e(TAG, "UdfpsDisplayMode.disable hook error", t);
-                    }
-                }
-            });
-
-            // Hook enable() for symmetry
-            XposedBridge.hookAllMethods(cls, "enable", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    Log.d(TAG, "UdfpsDisplayMode.enable() called");
-                }
-            });
-
-            Log.i(TAG, "Hooked UdfpsDisplayMode");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            Log.w(TAG, "UdfpsDisplayMode not found");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // system_server: AuthService.getUdfpsProps()
-    // -----------------------------------------------------------------------
-    private void hookAuthService(ClassLoader cl) {
-        try {
-            Class<?> cls = XposedHelpers.findClass(CLS_AUTH_SERVICE, cl);
-            Set<XC_MethodHook.Unhook> hooks = XposedBridge.hookAllMethods(
-                    cls, "getUdfpsProps", new XC_MethodHook() {
+            // Hook the method that stuffs extras into the battery intent.
+            // It returns void and takes no arguments in most AOSP builds.
+            XposedHelpers.findAndHookMethod(
+                    batteryServiceClass,
+                    "sendBatteryChangedIntentLocked",
+                    new XC_MethodHook() {
                         @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                String loc = sysPropGet(
-                                        "persist.vendor.fingerprint.optical.sensorlocation", "");
-                                if (TextUtils.isEmpty(loc) || !loc.contains("::")) return;
-                                String[] c = loc.split("::");
-                                if (c.length < 2) return;
-                                int x = Integer.parseInt(c[0].trim());
-                                int y = Integer.parseInt(c[1].trim());
-                                String sz = sysPropGet(
-                                        "persist.vendor.fingerprint.optical.iconsize", "0");
-                                int r = Integer.parseInt(sz.trim()) / 2;
-                                int[] props = {x, y, r};
-                                Log.i(TAG, "AuthService.getUdfpsProps → " + Arrays.toString(props));
-                                param.setResult(props);
-                            } catch (Throwable t) {
-                                Log.e(TAG, "getUdfpsProps error", t);
-                            }
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            // After the original method has put all standard
+                            // extras into the sticky broadcast, inject ours.
+                            injectVoocExtra(param.thisObject);
                         }
                     });
-            Log.i(TAG, "Hooked AuthService#getUdfpsProps (" + hooks.size() + ")");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            Log.e(TAG, "AuthService not found");
-        }
-    }
 
-    // -----------------------------------------------------------------------
-    // system_server: FingerprintCallback — HIDL path null callback fix
-    //
-    // "FingerprintCallback: sendUdfpsPointerDown, callback null"
-    // The callback (IUdfpsOverlayController) is only stored when
-    // halHandlesDisplayTouches == true at service init time.
-    // We hook the constructor to dump fields (once system_server is in scope)
-    // and force the sensor props.
-    // -----------------------------------------------------------------------
-    private void hookFingerprintCallback(ClassLoader cl) {
-        try {
-            Class<?> cls = XposedHelpers.findClass(CLS_FINGERPRINT_CALLBACK, cl);
-            Log.i(TAG, "Found FingerprintCallback");
-
-            XposedBridge.hookAllConstructors(cls, new XC_MethodHook() {
-                @Override
-                protected void afterHookedMethod(MethodHookParam param) {
-                    Log.i(TAG, "FingerprintCallback constructed");
-                    dumpObjectFields(param.thisObject, "FingerprintCallback");
-                    forceSensorPropsOnObject(param.thisObject, "FingerprintCallback ctor");
-                }
-            });
-
-            // Hook sendUdfpsPointerDown/Up to suppress the null crash
-            // and attempt to invoke the callback via reflection
-            for (String method : new String[]{"sendUdfpsPointerDown", "sendUdfpsPointerUp"}) {
-                final boolean isDown = method.equals("sendUdfpsPointerDown");
-                XposedBridge.hookAllMethods(cls, method, new XC_MethodHook() {
-                    @Override
-                    protected void beforeHookedMethod(MethodHookParam param) {
-                        Log.i(TAG, "FingerprintCallback." + method + " called");
-                        tryForwardUdfpsCallback(param.thisObject, isDown);
-                    }
-                });
-            }
-
-            // Hook all setters to catch when/if the callback ever gets registered
-            for (Method m : cls.getDeclaredMethods()) {
-                String n = m.getName();
-                if (n.startsWith("set") || n.contains("Udfps") || n.contains("Callback")
-                        || n.contains("Controller")) {
-                    try {
-                        XposedBridge.hookMethod(m, new XC_MethodHook() {
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                Log.i(TAG, "FingerprintCallback." + n
-                                        + "(" + Arrays.toString(param.args) + ")");
-                            }
-                        });
-                    } catch (Throwable ignored) {}
-                }
-            }
-
-            Log.i(TAG, "Hooked FingerprintCallback");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            Log.e(TAG, "FingerprintCallback not found");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // system_server: Fingerprint21 — HIDL sensor props
-    // -----------------------------------------------------------------------
-    private void hookFingerprint21(ClassLoader cl) {
-        for (String clsName : new String[]{CLS_FINGERPRINT21, CLS_FINGERPRINT21_UDFPS}) {
-            try {
-                Class<?> cls = XposedHelpers.findClass(clsName, cl);
-                Log.i(TAG, "Found " + clsName);
-
-                for (String method : new String[]{
-                        "getSensorProps", "getSensorProperties", "buildSensorProperties",
-                        "getSensorPropertiesInternal", "createAndRegisterService",
-                        "initForGoodiesOnly", "addSensor", "init", "start"}) {
-                    try {
-                        XposedBridge.hookAllMethods(cls, method, new XC_MethodHook() {
-                            @Override
-                            protected void beforeHookedMethod(MethodHookParam param) {
-                                for (Object arg : param.args) {
-                                    if (arg != null && arg.getClass().getName()
-                                            .equals(CLS_FP_SENSOR_PROPS)) {
-                                        forceSensorTypeUdfps(arg, clsName + "." + method + " arg");
-                                    }
-                                }
-                            }
-                            @Override
-                            protected void afterHookedMethod(MethodHookParam param) {
-                                Object r = param.getResult();
-                                if (r != null && r.getClass().getName().equals(CLS_FP_SENSOR_PROPS))
-                                    forceSensorTypeUdfps(r, clsName + "." + method + " return");
-                                forceSensorPropsOnObject(param.thisObject, clsName + "." + method);
-                            }
-                        });
-                    } catch (Throwable ignored) {}
-                }
-
-                XposedBridge.hookAllConstructors(cls, new XC_MethodHook() {
-                    @Override
-                    protected void afterHookedMethod(MethodHookParam param) {
-                        Log.i(TAG, clsName + " constructed");
-                        dumpObjectFields(param.thisObject, clsName);
-                        forceSensorPropsOnObject(param.thisObject, clsName + " ctor");
-                    }
-                });
-
-            } catch (XposedHelpers.ClassNotFoundError e) {
-                Log.d(TAG, clsName + " not found");
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // system_server: FingerprintProvider — AIDL path
-    // -----------------------------------------------------------------------
-    private void hookFingerprintProviderAidl(ClassLoader cl) {
-        try {
-            Class<?> cls = XposedHelpers.findClass(CLS_FP_PROVIDER, cl);
-            XposedBridge.hookAllMethods(cls, "addSensor", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    for (Object arg : param.args) {
-                        if (arg != null && arg.getClass().getName().equals(CLS_FP_SENSOR_PROPS))
-                            forceSensorTypeUdfps(arg, "FingerprintProvider.addSensor");
-                    }
-                }
-            });
-            Log.i(TAG, "Hooked FingerprintProvider#addSensor");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            Log.d(TAG, "FingerprintProvider (AIDL) not found");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // system_server: HidlToAidlSessionAdapter — suppress onUiReady exception
-    // -----------------------------------------------------------------------
-    private void hookHidlToAidlAdapter(ClassLoader cl) {
-        try {
-            Class<?> cls = XposedHelpers.findClass(CLS_HIDL_TO_AIDL, cl);
-            XposedBridge.hookAllMethods(cls, "onUiReady", new XC_MethodHook() {
-                @Override
-                protected void beforeHookedMethod(MethodHookParam param) {
-                    param.setResult(null);
-                    Log.d(TAG, "HidlToAidlSessionAdapter.onUiReady: suppressed");
-                }
-            });
-            Log.i(TAG, "Hooked HidlToAidlSessionAdapter#onUiReady");
-        } catch (XposedHelpers.ClassNotFoundError e) {
-            Log.w(TAG, "HidlToAidlSessionAdapter not found");
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Helpers
-    // -----------------------------------------------------------------------
-
-    private void dumpObjectFields(Object obj, String label) {
-        if (obj == null) return;
-        Class<?> cls = obj.getClass();
-        while (cls != null && !cls.getName().equals("java.lang.Object")) {
-            for (Field f : cls.getDeclaredFields()) {
-                try {
-                    f.setAccessible(true);
-                    String name = f.getName().toLowerCase();
-                    if (name.contains("callback") || name.contains("udfps")
-                            || name.contains("sensor") || name.contains("display")
-                            || name.contains("type") || name.contains("hal")
-                            || name.contains("controller") || name.contains("hidl")
-                            || name.contains("touch") || name.contains("overlay")) {
-                        Object val = f.get(obj);
-                        Log.i(TAG, label + " field [" + f.getName() + ":"
-                                + f.getType().getSimpleName() + "] = "
-                                + (val == null ? "NULL" : val.getClass().getName()
-                                        + "@" + Integer.toHexString(System.identityHashCode(val))));
-                    }
-                } catch (Throwable ignored) {}
-            }
-            cls = cls.getSuperclass();
-        }
-    }
-
-    private void forceSensorPropsOnObject(Object obj, String source) {
-        if (obj == null) return;
-        Class<?> cls = obj.getClass();
-        while (cls != null && !cls.getName().equals("java.lang.Object")) {
-            for (Field f : cls.getDeclaredFields()) {
-                try {
-                    f.setAccessible(true);
-                    Object val = f.get(obj);
-                    if (val != null && val.getClass().getName().equals(CLS_FP_SENSOR_PROPS))
-                        forceSensorTypeUdfps(val, source + " field:" + f.getName());
-                } catch (Throwable ignored) {}
-            }
-            cls = cls.getSuperclass();
-        }
-    }
-
-    private void forceSensorTypeUdfps(Object prop, String source) {
-        try {
-            Object[] locs = (Object[]) XposedHelpers.getObjectField(prop, "sensorLocations");
-            if (locs == null || locs.length == 0) return;
-            int x = XposedHelpers.getIntField(locs[0], "sensorLocationX");
-            if (x <= 0) return;
-            int cur = XposedHelpers.getIntField(prop, "sensorType");
-            if (cur == TYPE_UDFPS_OPTICAL) { Log.d(TAG, source + ": already UDFPS_OPTICAL"); return; }
-            XposedHelpers.setIntField(prop, "sensorType", TYPE_UDFPS_OPTICAL);
-            XposedHelpers.setBooleanField(prop, "halHandlesDisplayTouches", true);
-            Log.i(TAG, source + ": forced TYPE_UDFPS_OPTICAL (x=" + x + ")");
+            XposedBridge.log(TAG + ": hooked BatteryService.sendBatteryChangedIntentLocked");
         } catch (Throwable t) {
-            Log.e(TAG, "forceSensorTypeUdfps from " + source + ": " + t.getMessage());
+            XposedBridge.log(TAG + ": failed to hook BatteryService: " + t.getMessage());
         }
     }
 
     /**
-     * When sendUdfpsPointerDown/Up finds a null callback, scan all fields
-     * for any non-null interface that could serve as the UDFPS overlay controller
-     * and try to invoke it directly.
+     * Reads the sysfs node, then reaches into the BatteryService instance to
+     * find the pending Intent and injects the vooc_charger extra.
+     *
+     * The intent is stored in the field mBatteryChangedIntent (common AOSP name).
      */
-    private void tryForwardUdfpsCallback(Object fpCallback, boolean isDown) {
-        if (fpCallback == null) return;
-        Class<?> cls = fpCallback.getClass();
-        while (cls != null && !cls.getName().equals("java.lang.Object")) {
-            for (Field f : cls.getDeclaredFields()) {
-                try {
-                    f.setAccessible(true);
-                    Object val = f.get(fpCallback);
-                    String typeName = f.getType().getName();
-                    Log.i(TAG, "FingerprintCallback field [" + f.getName() + ":"
-                            + f.getType().getSimpleName() + "] = "
-                            + (val == null ? "NULL" : val.getClass().getName()));
-                    if (val != null && (typeName.contains("Udfps") || typeName.contains("Overlay")
-                            || typeName.contains("Callback") || typeName.contains("Controller"))) {
-                        String[] candidates = isDown
-                                ? new String[]{"onFingerDown", "sendUdfpsPointerDown", "onPointerDown"}
-                                : new String[]{"onFingerUp",   "sendUdfpsPointerUp",   "onPointerUp"};
-                        for (String mn : candidates) {
-                            try {
-                                val.getClass().getMethod(mn).invoke(val);
-                                Log.i(TAG, "Forwarded " + (isDown ? "down" : "up")
-                                        + " to " + typeName + "." + mn);
-                                return;
-                            } catch (NoSuchMethodException ignored) {}
-                        }
-                    }
-                } catch (Throwable ignored) {}
+    private void injectVoocExtra(Object batteryServiceInstance) {
+        boolean isVooc = isVoocCharger();
+        try {
+            // Try the common field name first; fall back to scanning fields.
+            Intent intent = (Intent) XposedHelpers.getObjectField(
+                    batteryServiceInstance, "mBatteryChangedIntent");
+            if (intent != null) {
+                intent.putExtra(EXTRA_VOOC_CHARGER, isVooc);
             }
-            cls = cls.getSuperclass();
+        } catch (Throwable t) {
+            // Field not found under that name — scan for Intent fields.
+            for (Field f : batteryServiceInstance.getClass().getDeclaredFields()) {
+                if (f.getType() == Intent.class) {
+                    try {
+                        f.setAccessible(true);
+                        Intent candidate = (Intent) f.get(batteryServiceInstance);
+                        if (candidate != null &&
+                                Intent.ACTION_BATTERY_CHANGED.equals(candidate.getAction())) {
+                            candidate.putExtra(EXTRA_VOOC_CHARGER, isVooc);
+                            break;
+                        }
+                    } catch (IllegalAccessException ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Reads /sys/class/power_supply/battery/voocchg_ing.
+     * Returns true only when the node exists and contains "1".
+     */
+    private boolean isVoocCharger() {
+        try (BufferedReader br = new BufferedReader(new FileReader(VOOC_NODE))) {
+            String line = br.readLine();
+            return "1".equals(line != null ? line.trim() : null);
+        } catch (FileNotFoundException e) {
+            // Node does not exist on this device — silently ignore.
+        } catch (IOException e) {
+            Log.w(TAG, "isVoocCharger IOException: " + e.getMessage());
+        }
+        return false;
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. BatteryStatus.getChargingSpeed() — return CHARGING_VOOC when needed
+    // -----------------------------------------------------------------------
+
+    /**
+     * The patch makes getChargingSpeed() return CHARGING_VOOC (3) when
+     * voocChargeStatus is true, before the normal wattage-based logic.
+     *
+     * We hook the constructor that takes an Intent so that voocChargeStatus is
+     * populated, and then hook getChargingSpeed() to honour it.
+     */
+    private void hookBatteryStatus(ClassLoader cl) {
+        try {
+            Class<?> batteryStatusClass = XposedHelpers.findClass(
+                    "com.android.settingslib.fuelgauge.BatteryStatus", cl);
+
+            // --- 2a. Hook Intent constructor to capture vooc_charger extra ---
+            XposedHelpers.findAndHookConstructor(
+                    batteryStatusClass,
+                    Intent.class,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            Intent intent = (Intent) param.args[0];
+                            if (intent == null) return;
+                            boolean vooc = intent.getBooleanExtra(EXTRA_VOOC_CHARGER, false);
+                            try {
+                                // Try to set the field if the ROM already has it.
+                                XposedHelpers.setObjectField(param.thisObject,
+                                        "voocChargeStatus", vooc);
+                            } catch (Throwable ignored) {
+                                // Field doesn't exist in this ROM — store in
+                                // the additional fields map instead.
+                                XposedHelpers.setAdditionalInstanceField(
+                                        param.thisObject, "voocChargeStatus", vooc);
+                            }
+                        }
+                    });
+
+            // --- 2b. Hook getChargingSpeed() to return CHARGING_VOOC ---
+            XposedHelpers.findAndHookMethod(
+                    batteryStatusClass,
+                    "getChargingSpeed",
+                    Resources.class,          // method signature: getChargingSpeed(Resources)
+                    new XC_MethodHook() {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            boolean vooc = getVoocStatus(param.thisObject);
+                            if (vooc) {
+                                param.setResult(CHARGING_VOOC);
+                            }
+                        }
+                    });
+
+            XposedBridge.log(TAG + ": hooked BatteryStatus");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": failed to hook BatteryStatus: " + t.getMessage());
+        }
+    }
+
+    /** Retrieves voocChargeStatus from either the real field or the extra-fields map. */
+    private boolean getVoocStatus(Object batteryStatusInstance) {
+        try {
+            Object val = XposedHelpers.getObjectField(batteryStatusInstance, "voocChargeStatus");
+            if (val instanceof Boolean) return (Boolean) val;
+        } catch (Throwable ignored) {
+        }
+        Object extra = XposedHelpers.getAdditionalInstanceField(
+                batteryStatusInstance, "voocChargeStatus");
+        return Boolean.TRUE.equals(extra);
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. KeyguardIndicationController — show "VOOC Charging" text
+    // -----------------------------------------------------------------------
+
+    /**
+     * Hooks the switch/if-else inside KeyguardIndicationController that selects
+     * the charging string resource ID, adding a branch for CHARGING_VOOC.
+     *
+     * The method of interest is updateBatteryIndication() or
+     * computePowerIndication() depending on the Android version.
+     */
+    private void hookKeyguardIndicationController(ClassLoader cl) {
+        try {
+            Class<?> kicClass = XposedHelpers.findClass(
+                    "com.android.systemui.statusbar.KeyguardIndicationController", cl);
+
+            // The method name changed across versions; try both.
+            String methodName = findChargingMethod(kicClass);
+            if (methodName == null) {
+                XposedBridge.log(TAG + ": KeyguardIndicationController charging method not found");
+                return;
+            }
+
+            XposedHelpers.findAndHookMethod(
+                    kicClass,
+                    methodName,
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            // If the result already mentions "VOOC" we're done.
+                            Object result = param.getResult();
+                            if (result instanceof CharSequence &&
+                                    result.toString().contains("VOOC")) {
+                                return;
+                            }
+                            overrideWithVoocString(param);
+                        }
+                    });
+
+            XposedBridge.log(TAG + ": hooked KeyguardIndicationController." + methodName);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": failed to hook KIC: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Scans for the method that returns the charging indication string.
+     * Returns the first matching method name, or null if none found.
+     */
+    private String findChargingMethod(Class<?> kicClass) {
+        String[] candidates = {
+                "computePowerIndication",
+                "updateBatteryIndication",
+                "getChargingMessage",
+        };
+        for (String name : candidates) {
+            try {
+                kicClass.getDeclaredMethod(name);
+                return name;
+            } catch (NoSuchMethodException ignored) {
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Checks if the current battery status is VOOC and, if so, replaces the
+     * return value of the indication method with a "VOOC Charging" string.
+     *
+     * We reach the BatteryStatus via the KIC's mBatteryStatus field (AOSP name).
+     */
+    private void overrideWithVoocString(XC_MethodHook.MethodHookParam param) {
+        try {
+            Object batteryStatus = XposedHelpers.getObjectField(
+                    param.thisObject, "mBatteryStatus");
+            if (batteryStatus == null) return;
+
+            boolean vooc = getVoocStatus(batteryStatus);
+            if (!vooc) return;
+
+            // Retrieve percentage so we can embed it in the string, matching
+            // the format: "%s • VOOC Charging"
+            int level = 0;
+            try {
+                level = (int) XposedHelpers.getIntField(batteryStatus, "level");
+            } catch (Throwable ignored) {
+            }
+
+            String indication = level + "% • VOOC Charging";
+            param.setResult(indication);
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": overrideWithVoocString error: " + t.getMessage());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. KeyguardUpdateMonitor — trigger refresh when voocChargeStatus changes
+    // -----------------------------------------------------------------------
+
+    /**
+     * The patch adds a check so that a change in VOOC status while plugged in
+     * triggers a keyguard indication update.
+     *
+     * We hook shouldTriggerBatteryUpdate() to return true when voocChargeStatus
+     * differs between current and old BatteryStatus.
+     */
+    private void hookKeyguardUpdateMonitor(ClassLoader cl) {
+        try {
+            Class<?> kumClass = XposedHelpers.findClass(
+                    "com.android.keyguard.KeyguardUpdateMonitor", cl);
+
+            XposedHelpers.findAndHookMethod(
+                    kumClass,
+                    "shouldTriggerBatteryUpdate",
+                    // Method signature: shouldTriggerBatteryUpdate(BatteryStatus, BatteryStatus)
+                    XposedHelpers.findClass(
+                            "com.android.settingslib.fuelgauge.BatteryStatus", cl),
+                    XposedHelpers.findClass(
+                            "com.android.settingslib.fuelgauge.BatteryStatus", cl),
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            // Only override if the original returned false.
+                            if (Boolean.TRUE.equals(param.getResult())) return;
+
+                            Object current = param.args[0];
+                            Object old     = param.args[1];
+                            if (current == null || old == null) return;
+
+                            boolean currentVooc = getVoocStatus(current);
+                            boolean oldVooc     = getVoocStatus(old);
+
+                            if (currentVooc != oldVooc) {
+                                param.setResult(true);
+                            }
+                        }
+                    });
+
+            XposedBridge.log(TAG + ": hooked KeyguardUpdateMonitor.shouldTriggerBatteryUpdate");
+        } catch (Throwable t) {
+            // Method signature may differ — not fatal, rest of module still works.
+            XposedBridge.log(TAG + ": failed to hook KUM (non-fatal): " + t.getMessage());
         }
     }
 }
