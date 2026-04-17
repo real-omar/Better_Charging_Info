@@ -3,7 +3,7 @@ package com.omar.vooc_info;
 import android.content.Context;
 import android.content.Intent;
 import android.content.res.Resources;
-import android.text.format.Formatter;
+
 import android.util.Log;
 
 import java.io.BufferedReader;
@@ -272,15 +272,11 @@ public class MainHook implements IXposedHookLoadPackage {
 
             String result;
             if (hasTime) {
-                // "%2$s • VOOC Charging (%1$s until full)"
-                // arg1 = time string, arg2 = percentage
-                String timeStr = Formatter.formatShortElapsedTimeRoundingUpToMinutes(
-                        ctx, timeRemaining);
-                // We inline the string rather than relying on a resource ID that
-                // may not exist in the GSI. Format matches the patch's strings.xml.
+                // formatShortElapsedTimeRoundingUpToMinutes is @hide — call via reflection.
+                // Falls back to a plain "Xh Ym" string if the method is unavailable.
+                String timeStr = formatElapsedTime(ctx, timeRemaining);
                 result = pct + " \u2022 VOOC Charging (" + timeStr + " until full)";
             } else {
-                // "%s • VOOC Charging"
                 result = pct + " \u2022 VOOC Charging";
             }
 
@@ -289,6 +285,32 @@ public class MainHook implements IXposedHookLoadPackage {
         } catch (Throwable t) {
             XposedBridge.log(TAG + ": buildVoocIndication error: " + t.getMessage());
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /**
+     * Calls android.text.format.Formatter.formatShortElapsedTimeRoundingUpToMinutes
+     * via reflection (it is @hide and not in the public SDK).
+     * Falls back to a simple "Xh Ym" string if reflection fails.
+     */
+    private String formatElapsedTime(Context ctx, long millis) {
+        try {
+            Class<?> cls = Class.forName("android.text.format.Formatter");
+            java.lang.reflect.Method m = cls.getMethod(
+                    "formatShortElapsedTimeRoundingUpToMinutes",
+                    Context.class, long.class);
+            return (String) m.invoke(null, ctx, millis);
+        } catch (Throwable ignored) {
+        }
+        // Plain fallback: "1h 23m" style
+        long totalMinutes = (millis + 59_999) / 60_000;
+        long hours   = totalMinutes / 60;
+        long minutes = totalMinutes % 60;
+        if (hours > 0) return hours + "h " + minutes + "m";
+        return minutes + "m";
     }
 
     // -----------------------------------------------------------------------
