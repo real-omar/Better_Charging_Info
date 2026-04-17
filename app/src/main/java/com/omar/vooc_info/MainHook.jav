@@ -1,7 +1,9 @@
 package com.omar.vooc_info;
+
+import android.content.Context;
 import android.content.Intent;
 import android.content.res.Resources;
-import android.os.Bundle;
+import android.text.format.Formatter;
 import android.util.Log;
 
 import java.io.BufferedReader;
@@ -9,6 +11,7 @@ import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
 import java.lang.reflect.Field;
+import java.text.NumberFormat;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -19,29 +22,39 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 /**
  * LSPosed module that backports VOOC fast-charging support to GSI / AOSP ROMs.
  *
- * What the original patch does (summarised):
- *  1. BatteryService reads /sys/class/power_supply/battery/voocchg_ing and
- *     injects "vooc_charger" = true into ACTION_BATTERY_CHANGED when the node
- *     reads "1".
- *  2. BatteryStatus.getChargingSpeed() returns CHARGING_VOOC (3) when
- *     voocChargeStatus is true.
- *  3. KeyguardIndicationController shows "VOOC Charging" text on the lock
- *     screen for CHARGING_VOOC.
+ * Pipeline:
+ *  1. BatteryService.sendBatteryChangedIntentLocked() — after hook reads
+ *     /sys/class/power_supply/battery/voocchg_ing and injects
+ *     "vooc_charger" = true into the sticky ACTION_BATTERY_CHANGED intent.
  *
- * All three behaviours are replicated here via hooks, so no framework source
- * changes or custom ROM are required.
+ *  2. BatteryStatus(Intent) constructor — after hook reads vooc_charger from
+ *     the intent and stores it. BatteryStatus.getChargingSpeed() — before hook
+ *     returns CHARGING_VOOC (3) when the flag is set.
+ *
+ *  3. KeyguardIndicationController.computePowerIndication() — before hook:
+ *     when mChargingSpeed == 3 (VOOC) AND mPowerPluggedInWired is true, the
+ *     method builds and returns the "VOOC Charging" string itself, short-
+ *     circuiting the original logic entirely.
+ *     This exactly mirrors the extra case added by the patch.
+ *
+ *  4. KeyguardUpdateMonitor.shouldTriggerBatteryUpdate() — after hook forces
+ *     true when voocChargeStatus changes between old and new BatteryStatus.
  */
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "VoocChargerHook";
 
-    // Path to the kernel sysfs node that signals VOOC charging
+    /** Kernel sysfs node written by the VOOC charger driver. */
     private static final String VOOC_NODE = "/sys/class/power_supply/battery/voocchg_ing";
 
-    // Extra key added by the patch to ACTION_BATTERY_CHANGED
+    /** Extra key injected into ACTION_BATTERY_CHANGED. */
     private static final String EXTRA_VOOC_CHARGER = "vooc_charger";
 
-    // BatteryStatus charging speed constant added by the patch
+    /**
+     * Charging speed constant for VOOC — value 3, sitting above CHARGING_FAST (2).
+     * Used both in BatteryStatus.getChargingSpeed() and as the sentinel we write
+     * into KIC's mChargingSpeed field.
+     */
     private static final int CHARGING_VOOC = 3;
 
     // -----------------------------------------------------------------------
@@ -52,12 +65,9 @@ public class MainHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
         switch (lpparam.packageName) {
             case "android":
-                // BatteryService lives in the system_server process whose
-                // package name is reported as "android".
                 hookBatteryService(lpparam.classLoader);
                 hookBatteryStatus(lpparam.classLoader);
                 break;
-
             case "com.android.systemui":
                 hookKeyguardIndicationController(lpparam.classLoader);
                 hookKeyguardUpdateMonitor(lpparam.classLoader);
@@ -69,141 +79,90 @@ public class MainHook implements IXposedHookLoadPackage {
     // 1. BatteryService — inject vooc_charger into ACTION_BATTERY_CHANGED
     // -----------------------------------------------------------------------
 
-    /**
-     * Hook BatteryService.sendBatteryChangedIntentLocked() (or the equivalent
-     * method that builds / broadcasts ACTION_BATTERY_CHANGED).
-     *
-     * The exact method name varies slightly between Android versions:
-     *   - Android R/S: sendBatteryChangedIntentLocked
-     *   - Some builds:  broadcastBatteryStatsLocked / sendIntentLocked
-     *
-     * We hook the method that calls intent.putExtra(...) for battery fields and
-     * inject our own extra right after.
-     */
     private void hookBatteryService(ClassLoader cl) {
         try {
-            Class<?> batteryServiceClass =
-                    XposedHelpers.findClass("com.android.server.BatteryService", cl);
-
-            // Hook the method that stuffs extras into the battery intent.
-            // It returns void and takes no arguments in most AOSP builds.
-            XposedHelpers.findAndHookMethod(
-                    batteryServiceClass,
-                    "sendBatteryChangedIntentLocked",
+            Class<?> cls = XposedHelpers.findClass("com.android.server.BatteryService", cl);
+            XposedHelpers.findAndHookMethod(cls, "sendBatteryChangedIntentLocked",
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            // After the original method has put all standard
-                            // extras into the sticky broadcast, inject ours.
                             injectVoocExtra(param.thisObject);
                         }
                     });
-
             XposedBridge.log(TAG + ": hooked BatteryService.sendBatteryChangedIntentLocked");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": failed to hook BatteryService: " + t.getMessage());
+            XposedBridge.log(TAG + ": BatteryService hook failed: " + t.getMessage());
         }
     }
 
     /**
-     * Reads the sysfs node, then reaches into the BatteryService instance to
-     * find the pending Intent and injects the vooc_charger extra.
-     *
-     * The intent is stored in the field mBatteryChangedIntent (common AOSP name).
+     * After sendBatteryChangedIntentLocked() runs, reads the sysfs node and
+     * injects the extra into the pending sticky intent (mBatteryChangedIntent).
      */
-    private void injectVoocExtra(Object batteryServiceInstance) {
-        boolean isVooc = isVoocCharger();
+    private void injectVoocExtra(Object svc) {
+        boolean vooc = isVoocCharger();
         try {
-            // Try the common field name first; fall back to scanning fields.
-            Intent intent = (Intent) XposedHelpers.getObjectField(
-                    batteryServiceInstance, "mBatteryChangedIntent");
+            Intent intent = (Intent) XposedHelpers.getObjectField(svc, "mBatteryChangedIntent");
             if (intent != null) {
-                intent.putExtra(EXTRA_VOOC_CHARGER, isVooc);
+                intent.putExtra(EXTRA_VOOC_CHARGER, vooc);
+                return;
             }
-        } catch (Throwable t) {
-            // Field not found under that name — scan for Intent fields.
-            for (Field f : batteryServiceInstance.getClass().getDeclaredFields()) {
-                if (f.getType() == Intent.class) {
-                    try {
-                        f.setAccessible(true);
-                        Intent candidate = (Intent) f.get(batteryServiceInstance);
-                        if (candidate != null &&
-                                Intent.ACTION_BATTERY_CHANGED.equals(candidate.getAction())) {
-                            candidate.putExtra(EXTRA_VOOC_CHARGER, isVooc);
-                            break;
-                        }
-                    } catch (IllegalAccessException ignored) {
-                    }
+        } catch (Throwable ignored) {
+        }
+        // Fallback: scan all Intent fields for one with ACTION_BATTERY_CHANGED.
+        for (Field f : svc.getClass().getDeclaredFields()) {
+            if (!Intent.class.isAssignableFrom(f.getType())) continue;
+            try {
+                f.setAccessible(true);
+                Intent candidate = (Intent) f.get(svc);
+                if (candidate != null &&
+                        Intent.ACTION_BATTERY_CHANGED.equals(candidate.getAction())) {
+                    candidate.putExtra(EXTRA_VOOC_CHARGER, vooc);
+                    return;
                 }
+            } catch (IllegalAccessException ignored) {
             }
         }
     }
 
-    /**
-     * Reads /sys/class/power_supply/battery/voocchg_ing.
-     * Returns true only when the node exists and contains "1".
-     */
+    /** Returns true iff the VOOC sysfs node exists and reads "1". */
     private boolean isVoocCharger() {
         try (BufferedReader br = new BufferedReader(new FileReader(VOOC_NODE))) {
             String line = br.readLine();
             return "1".equals(line != null ? line.trim() : null);
-        } catch (FileNotFoundException e) {
-            // Node does not exist on this device — silently ignore.
+        } catch (FileNotFoundException ignored) {
         } catch (IOException e) {
-            Log.w(TAG, "isVoocCharger IOException: " + e.getMessage());
+            Log.w(TAG, "isVoocCharger: " + e.getMessage());
         }
         return false;
     }
 
     // -----------------------------------------------------------------------
-    // 2. BatteryStatus.getChargingSpeed() — return CHARGING_VOOC when needed
+    // 2. BatteryStatus — track voocChargeStatus, override getChargingSpeed()
     // -----------------------------------------------------------------------
 
-    /**
-     * The patch makes getChargingSpeed() return CHARGING_VOOC (3) when
-     * voocChargeStatus is true, before the normal wattage-based logic.
-     *
-     * We hook the constructor that takes an Intent so that voocChargeStatus is
-     * populated, and then hook getChargingSpeed() to honour it.
-     */
     private void hookBatteryStatus(ClassLoader cl) {
         try {
-            Class<?> batteryStatusClass = XposedHelpers.findClass(
+            Class<?> cls = XposedHelpers.findClass(
                     "com.android.settingslib.fuelgauge.BatteryStatus", cl);
 
-            // --- 2a. Hook Intent constructor to capture vooc_charger extra ---
-            XposedHelpers.findAndHookConstructor(
-                    batteryStatusClass,
-                    Intent.class,
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            Intent intent = (Intent) param.args[0];
-                            if (intent == null) return;
-                            boolean vooc = intent.getBooleanExtra(EXTRA_VOOC_CHARGER, false);
-                            try {
-                                // Try to set the field if the ROM already has it.
-                                XposedHelpers.setObjectField(param.thisObject,
-                                        "voocChargeStatus", vooc);
-                            } catch (Throwable ignored) {
-                                // Field doesn't exist in this ROM — store in
-                                // the additional fields map instead.
-                                XposedHelpers.setAdditionalInstanceField(
-                                        param.thisObject, "voocChargeStatus", vooc);
-                            }
-                        }
-                    });
+            // 2a. Read vooc_charger from intent in the Intent constructor.
+            XposedHelpers.findAndHookConstructor(cls, Intent.class, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    Intent intent = (Intent) param.args[0];
+                    if (intent == null) return;
+                    boolean vooc = intent.getBooleanExtra(EXTRA_VOOC_CHARGER, false);
+                    storeVoocStatus(param.thisObject, vooc);
+                }
+            });
 
-            // --- 2b. Hook getChargingSpeed() to return CHARGING_VOOC ---
-            XposedHelpers.findAndHookMethod(
-                    batteryStatusClass,
-                    "getChargingSpeed",
-                    Resources.class,          // method signature: getChargingSpeed(Resources)
+            // 2b. Short-circuit getChargingSpeed() for VOOC.
+            XposedHelpers.findAndHookMethod(cls, "getChargingSpeed", Resources.class,
                     new XC_MethodHook() {
                         @Override
                         protected void beforeHookedMethod(MethodHookParam param) {
-                            boolean vooc = getVoocStatus(param.thisObject);
-                            if (vooc) {
+                            if (loadVoocStatus(param.thisObject)) {
                                 param.setResult(CHARGING_VOOC);
                             }
                         }
@@ -211,164 +170,164 @@ public class MainHook implements IXposedHookLoadPackage {
 
             XposedBridge.log(TAG + ": hooked BatteryStatus");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": failed to hook BatteryStatus: " + t.getMessage());
+            XposedBridge.log(TAG + ": BatteryStatus hook failed: " + t.getMessage());
         }
     }
 
-    /** Retrieves voocChargeStatus from either the real field or the extra-fields map. */
-    private boolean getVoocStatus(Object batteryStatusInstance) {
+    private void storeVoocStatus(Object obj, boolean vooc) {
         try {
-            Object val = XposedHelpers.getObjectField(batteryStatusInstance, "voocChargeStatus");
-            if (val instanceof Boolean) return (Boolean) val;
+            XposedHelpers.setBooleanField(obj, "voocChargeStatus", vooc);
+        } catch (Throwable ignored) {
+            XposedHelpers.setAdditionalInstanceField(obj, "voocChargeStatus", vooc);
+        }
+    }
+
+    private boolean loadVoocStatus(Object obj) {
+        try {
+            return XposedHelpers.getBooleanField(obj, "voocChargeStatus");
         } catch (Throwable ignored) {
         }
-        Object extra = XposedHelpers.getAdditionalInstanceField(
-                batteryStatusInstance, "voocChargeStatus");
-        return Boolean.TRUE.equals(extra);
+        Object v = XposedHelpers.getAdditionalInstanceField(obj, "voocChargeStatus");
+        return Boolean.TRUE.equals(v);
     }
 
     // -----------------------------------------------------------------------
-    // 3. KeyguardIndicationController — show "VOOC Charging" text
+    // 3. KeyguardIndicationController.computePowerIndication()
+    //
+    // Smali analysis of the actual method on this ROM:
+    //
+    //   • mBatteryDefender        → early return (battery defender string)
+    //   • mPowerPluggedIn && mIncompatibleCharger → early return (incompatible)
+    //   • mPowerCharged           → early return (charged string)
+    //   • hasChargingTime = mChargingTimeRemaining > 0
+    //   • if mPowerPluggedInWired:
+    //       switch mChargingSpeed:
+    //         0 (slow)  → slowly strings
+    //         2 (fast)  → fast strings        ← patch inserts case 3 (VOOC) here
+    //         else      → regular strings
+    //   • elif mPowerPluggedInWireless → wireless strings
+    //   • elif mPowerPluggedInDock     → dock strings
+    //   • else                         → regular strings
+    //   • format with percent + optional time-remaining
+    //
+    // We hook BEFORE the method runs. When mChargingSpeed == 3 and
+    // mPowerPluggedInWired is true, we replicate the exact string-building
+    // logic for the VOOC case and setResult(), preventing the original from
+    // running.
     // -----------------------------------------------------------------------
 
-    /**
-     * Hooks the switch/if-else inside KeyguardIndicationController that selects
-     * the charging string resource ID, adding a branch for CHARGING_VOOC.
-     *
-     * The method of interest is updateBatteryIndication() or
-     * computePowerIndication() depending on the Android version.
-     */
     private void hookKeyguardIndicationController(ClassLoader cl) {
         try {
             Class<?> kicClass = XposedHelpers.findClass(
                     "com.android.systemui.statusbar.KeyguardIndicationController", cl);
 
-            // The method name changed across versions; try both.
-            String methodName = findChargingMethod(kicClass);
-            if (methodName == null) {
-                XposedBridge.log(TAG + ": KeyguardIndicationController charging method not found");
-                return;
-            }
-
-            XposedHelpers.findAndHookMethod(
-                    kicClass,
-                    methodName,
+            XposedHelpers.findAndHookMethod(kicClass, "computePowerIndication",
                     new XC_MethodHook() {
                         @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            // If the result already mentions "VOOC" we're done.
-                            Object result = param.getResult();
-                            if (result instanceof CharSequence &&
-                                    result.toString().contains("VOOC")) {
-                                return;
-                            }
-                            overrideWithVoocString(param);
+                        protected void beforeHookedMethod(MethodHookParam param)
+                                throws Throwable {
+                            buildVoocIndication(param);
                         }
                     });
 
-            XposedBridge.log(TAG + ": hooked KeyguardIndicationController." + methodName);
+            XposedBridge.log(TAG + ": hooked KIC.computePowerIndication");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": failed to hook KIC: " + t.getMessage());
+            XposedBridge.log(TAG + ": KIC hook failed: " + t.getMessage());
         }
     }
 
     /**
-     * Scans for the method that returns the charging indication string.
-     * Returns the first matching method name, or null if none found.
-     */
-    private String findChargingMethod(Class<?> kicClass) {
-        String[] candidates = {
-                "computePowerIndication",
-                "updateBatteryIndication",
-                "getChargingMessage",
-        };
-        for (String name : candidates) {
-            try {
-                kicClass.getDeclaredMethod(name);
-                return name;
-            } catch (NoSuchMethodException ignored) {
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Checks if the current battery status is VOOC and, if so, replaces the
-     * return value of the indication method with a "VOOC Charging" string.
+     * Called before computePowerIndication(). Checks the same guards the
+     * original method does, then builds the VOOC string if appropriate.
      *
-     * We reach the BatteryStatus via the KIC's mBatteryStatus field (AOSP name).
+     * Field names are taken directly from the smali disassembly:
+     *   mBatteryDefender, mPowerPluggedIn, mIncompatibleCharger, mPowerCharged,
+     *   mChargingTimeRemaining (long), mPowerPluggedInWired, mChargingSpeed (int),
+     *   mBatteryLevel (int), mContext.
      */
-    private void overrideWithVoocString(XC_MethodHook.MethodHookParam param) {
+    private void buildVoocIndication(XC_MethodHook.MethodHookParam param) {
+        Object kic = param.thisObject;
         try {
-            Object batteryStatus = XposedHelpers.getObjectField(
-                    param.thisObject, "mBatteryStatus");
-            if (batteryStatus == null) return;
+            // Mirror the early-return guards so we don't interfere with them.
+            if (XposedHelpers.getBooleanField(kic, "mBatteryDefender")) return;
+            if (XposedHelpers.getBooleanField(kic, "mPowerPluggedIn") &&
+                    XposedHelpers.getBooleanField(kic, "mIncompatibleCharger")) return;
+            if (XposedHelpers.getBooleanField(kic, "mPowerCharged")) return;
 
-            boolean vooc = getVoocStatus(batteryStatus);
-            if (!vooc) return;
+            // Only intercept when wired AND speed == VOOC.
+            if (!XposedHelpers.getBooleanField(kic, "mPowerPluggedInWired")) return;
+            int speed = XposedHelpers.getIntField(kic, "mChargingSpeed");
+            if (speed != CHARGING_VOOC) return;
 
-            // Retrieve percentage so we can embed it in the string, matching
-            // the format: "%s • VOOC Charging"
-            int level = 0;
-            try {
-                level = (int) XposedHelpers.getIntField(batteryStatus, "level");
-            } catch (Throwable ignored) {
+            // --- Build the string exactly as computePowerIndication() does ---
+            Context ctx = (Context) XposedHelpers.getObjectField(kic, "mContext");
+            Resources res = ctx.getResources();
+
+            long timeRemaining = XposedHelpers.getLongField(kic, "mChargingTimeRemaining");
+            boolean hasTime = timeRemaining > 0;
+
+            // Format battery level as a percentage string (e.g. "73%").
+            int level = XposedHelpers.getIntField(kic, "mBatteryLevel");
+            String pct = NumberFormat.getPercentInstance().format(level / 100.0);
+
+            String result;
+            if (hasTime) {
+                // "%2$s • VOOC Charging (%1$s until full)"
+                // arg1 = time string, arg2 = percentage
+                String timeStr = Formatter.formatShortElapsedTimeRoundingUpToMinutes(
+                        ctx, timeRemaining);
+                // We inline the string rather than relying on a resource ID that
+                // may not exist in the GSI. Format matches the patch's strings.xml.
+                result = pct + " \u2022 VOOC Charging (" + timeStr + " until full)";
+            } else {
+                // "%s • VOOC Charging"
+                result = pct + " \u2022 VOOC Charging";
             }
 
-            String indication = level + "% • VOOC Charging";
-            param.setResult(indication);
+            param.setResult(result);
+
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": overrideWithVoocString error: " + t.getMessage());
+            XposedBridge.log(TAG + ": buildVoocIndication error: " + t.getMessage());
         }
     }
 
     // -----------------------------------------------------------------------
-    // 4. KeyguardUpdateMonitor — trigger refresh when voocChargeStatus changes
+    // 4. KeyguardUpdateMonitor — force refresh when VOOC status changes
     // -----------------------------------------------------------------------
 
     /**
-     * The patch adds a check so that a change in VOOC status while plugged in
-     * triggers a keyguard indication update.
-     *
-     * We hook shouldTriggerBatteryUpdate() to return true when voocChargeStatus
-     * differs between current and old BatteryStatus.
+     * Hooks shouldTriggerBatteryUpdate(BatteryStatus old, BatteryStatus current).
+     * Returns true (force update) when voocChargeStatus changed between the two,
+     * matching the patch's added guard:
+     *   if (nowPluggedIn && current.voocChargeStatus != old.voocChargeStatus)
+     *       return true;
      */
     private void hookKeyguardUpdateMonitor(ClassLoader cl) {
         try {
             Class<?> kumClass = XposedHelpers.findClass(
                     "com.android.keyguard.KeyguardUpdateMonitor", cl);
+            Class<?> bsClass = XposedHelpers.findClass(
+                    "com.android.settingslib.fuelgauge.BatteryStatus", cl);
 
-            XposedHelpers.findAndHookMethod(
-                    kumClass,
-                    "shouldTriggerBatteryUpdate",
-                    // Method signature: shouldTriggerBatteryUpdate(BatteryStatus, BatteryStatus)
-                    XposedHelpers.findClass(
-                            "com.android.settingslib.fuelgauge.BatteryStatus", cl),
-                    XposedHelpers.findClass(
-                            "com.android.settingslib.fuelgauge.BatteryStatus", cl),
+            XposedHelpers.findAndHookMethod(kumClass, "shouldTriggerBatteryUpdate",
+                    bsClass, bsClass,
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
-                            // Only override if the original returned false.
                             if (Boolean.TRUE.equals(param.getResult())) return;
-
-                            Object current = param.args[0];
-                            Object old     = param.args[1];
-                            if (current == null || old == null) return;
-
-                            boolean currentVooc = getVoocStatus(current);
-                            boolean oldVooc     = getVoocStatus(old);
-
-                            if (currentVooc != oldVooc) {
+                            Object oldStatus     = param.args[0];
+                            Object currentStatus = param.args[1];
+                            if (oldStatus == null || currentStatus == null) return;
+                            if (loadVoocStatus(currentStatus) != loadVoocStatus(oldStatus)) {
                                 param.setResult(true);
                             }
                         }
                     });
 
-            XposedBridge.log(TAG + ": hooked KeyguardUpdateMonitor.shouldTriggerBatteryUpdate");
+            XposedBridge.log(TAG + ": hooked KUM.shouldTriggerBatteryUpdate");
         } catch (Throwable t) {
-            // Method signature may differ — not fatal, rest of module still works.
-            XposedBridge.log(TAG + ": failed to hook KUM (non-fatal): " + t.getMessage());
+            // Non-fatal: the indication text still works without this.
+            XposedBridge.log(TAG + ": KUM hook failed (non-fatal): " + t.getMessage());
         }
     }
 }
