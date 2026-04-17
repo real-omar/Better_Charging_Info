@@ -1,5 +1,4 @@
-package com.mrx7014.s25ultraspoofer;
-
+package com.omar.vooc_info;
 import android.content.Intent;
 import android.content.res.Resources;
 import android.os.Bundle;
