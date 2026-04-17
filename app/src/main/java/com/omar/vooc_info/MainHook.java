@@ -66,9 +66,11 @@ public class MainHook implements IXposedHookLoadPackage {
         switch (lpparam.packageName) {
             case "android":
                 hookBatteryService(lpparam.classLoader);
-                hookBatteryStatus(lpparam.classLoader);
                 break;
             case "com.android.systemui":
+                // BatteryStatus lives in settingslib which is on SystemUI's classpath
+                // but NOT on system_server's at hook time — so hook it here.
+                hookBatteryStatus(lpparam.classLoader);
                 hookKeyguardIndicationController(lpparam.classLoader);
                 hookKeyguardUpdateMonitor(lpparam.classLoader);
                 break;
@@ -80,18 +82,53 @@ public class MainHook implements IXposedHookLoadPackage {
     // -----------------------------------------------------------------------
 
     private void hookBatteryService(ClassLoader cl) {
+        Class<?> cls;
         try {
-            Class<?> cls = XposedHelpers.findClass("com.android.server.BatteryService", cl);
-            XposedHelpers.findAndHookMethod(cls, "sendBatteryChangedIntentLocked",
-                    new XC_MethodHook() {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            injectVoocExtra(param.thisObject);
-                        }
-                    });
-            XposedBridge.log(TAG + ": hooked BatteryService.sendBatteryChangedIntentLocked");
+            cls = XposedHelpers.findClass("com.android.server.BatteryService", cl);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": BatteryService hook failed: " + t.getMessage());
+            XposedBridge.log(TAG + ": BatteryService class not found: " + t.getMessage());
+            return;
+        }
+
+        // The method name varies across GSI / ROM builds. Try known names first.
+        String[] candidates = {
+            "sendBatteryChangedIntentLocked", // AOSP R/S mainline
+            "processValuesLocked",            // some GSIs
+            "update",                         // older / vendor variants
+        };
+        XC_MethodHook cb = new XC_MethodHook() {
+            @Override
+            protected void afterHookedMethod(MethodHookParam param) {
+                injectVoocExtra(param.thisObject);
+            }
+        };
+        for (String name : candidates) {
+            try {
+                XposedHelpers.findAndHookMethod(cls, name, cb);
+                XposedBridge.log(TAG + ": hooked BatteryService." + name);
+                return;
+            } catch (Throwable ignored) {
+            }
+        }
+
+        // Fallback: scan all declared void no-arg methods whose name hints at
+        // intent/send/broadcast/update and hook them all. injectVoocExtra is idempotent.
+        int hooked = 0;
+        for (java.lang.reflect.Method m : cls.getDeclaredMethods()) {
+            if (m.getReturnType() != void.class || m.getParameterCount() != 0) continue;
+            String n = m.getName().toLowerCase();
+            if (n.contains("intent") || n.contains("send")
+                    || n.contains("broadcast") || n.contains("update")) {
+                try {
+                    XposedBridge.hookMethod(m, cb);
+                    XposedBridge.log(TAG + ": hooked BatteryService." + m.getName() + " (scan)");
+                    hooked++;
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        if (hooked == 0) {
+            XposedBridge.log(TAG + ": BatteryService — no suitable method found");
         }
     }
 
@@ -328,11 +365,12 @@ public class MainHook implements IXposedHookLoadPackage {
         try {
             Class<?> kumClass = XposedHelpers.findClass(
                     "com.android.keyguard.KeyguardUpdateMonitor", cl);
-            Class<?> bsClass = XposedHelpers.findClass(
-                    "com.android.settingslib.fuelgauge.BatteryStatus", cl);
 
+            // Use the string overload for the BatteryStatus param type so we
+            // don't trigger a ClassNotFoundException during method lookup.
             XposedHelpers.findAndHookMethod(kumClass, "shouldTriggerBatteryUpdate",
-                    bsClass, bsClass,
+                    "com.android.settingslib.fuelgauge.BatteryStatus",
+                    "com.android.settingslib.fuelgauge.BatteryStatus",
                     new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) {
@@ -348,7 +386,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
             XposedBridge.log(TAG + ": hooked KUM.shouldTriggerBatteryUpdate");
         } catch (Throwable t) {
-            // Non-fatal: the indication text still works without this.
             XposedBridge.log(TAG + ": KUM hook failed (non-fatal): " + t.getMessage());
         }
     }
