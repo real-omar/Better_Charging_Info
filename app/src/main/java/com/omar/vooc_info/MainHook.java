@@ -188,9 +188,15 @@ public class MainHook implements IXposedHookLoadPackage {
             if (!isVoocCharger()) return;
 
             Context ctx = (Context) XposedHelpers.getObjectField(kic, "mContext");
-            long timeRemaining = XposedHelpers.getLongField(kic, "mChargingTimeRemaining");
             int level = XposedHelpers.getIntField(kic, "mBatteryLevel");
             String pct = NumberFormat.getPercentInstance().format(level / 100.0);
+
+            // Try our own sysfs-based estimate first; fall back to whatever
+            // the framework put in mChargingTimeRemaining (often 0 on MT6771).
+            long timeRemaining = estimateChargingTimeMs();
+            if (timeRemaining <= 0) {
+                timeRemaining = XposedHelpers.getLongField(kic, "mChargingTimeRemaining");
+            }
 
             String result;
             if (timeRemaining > 0) {
@@ -221,6 +227,85 @@ public class MainHook implements IXposedHookLoadPackage {
             Log.w(TAG, "isVoocCharger: " + e.getMessage());
         }
         return false;
+    }
+
+    /**
+     * Estimates remaining charge time in milliseconds using sysfs nodes.
+     *
+     * Formula:
+     *   remaining_charge_µAh = charge_full_µAh - charge_now_µAh
+     *   current_µA           = current_now  (MT6771 reports positive while charging)
+     *   time_ms              = (remaining_charge_µAh / current_µA) * 3_600_000
+     *
+     * charge_full / charge_now are the most accurate source. If unavailable we
+     * fall back to a voltage-weighted estimate using voltage_now / voltage_min
+     * as a proxy for remaining capacity.
+     *
+     * Returns ≤ 0 if the estimate cannot be made (node missing, current = 0,
+     * battery already full, etc.).
+     */
+    private long estimateChargingTimeMs() {
+        try {
+            long currentMicroA = readSysfsLong("/sys/class/power_supply/battery/current_now");
+            // On MT6771 current_now is positive while charging.
+            // Some kernels report it negative (discharging convention) — take abs.
+            currentMicroA = Math.abs(currentMicroA);
+            if (currentMicroA < 1000) return -1; // < 1 mA — no meaningful current
+
+            // --- Primary path: charge_full + charge_now (µAh) ---
+            long chargeFull = readSysfsLong("/sys/class/power_supply/battery/charge_full");
+            long chargeNow  = readSysfsLong("/sys/class/power_supply/battery/charge_now");
+            if (chargeFull > 0 && chargeNow >= 0 && chargeFull > chargeNow) {
+                long remainingMicroAh = chargeFull - chargeNow;
+                // time_ms = (µAh / µA) * 3_600_000 ms/h
+                return (remainingMicroAh * 3_600_000L) / currentMicroA;
+            }
+
+            // --- Fallback: voltage-based capacity estimate ---
+            // remaining_fraction ≈ (voltage_now - voltage_min) / (voltage_max - voltage_min)
+            // We use voltage_min as the empty voltage and a fixed 4200 mV as full.
+            long voltageNow = readSysfsLong("/sys/class/power_supply/battery/voltage_now"); // µV
+            long voltageMin = readSysfsLong("/sys/class/power_supply/battery/voltage_min"); // µV
+            long currentMax = readSysfsLong("/sys/class/power_supply/battery/current_max"); // µA
+            if (voltageNow > 0 && voltageMin > 0 && voltageNow > voltageMin) {
+                // Assume 4200 mV = full for Li-Ion
+                final long voltageFullMicroV = 4_200_000L;
+                long voltageRange = voltageFullMicroV - voltageMin;
+                if (voltageRange <= 0) return -1;
+                double remainingFraction = 1.0 - ((double)(voltageNow - voltageMin) / voltageRange);
+                if (remainingFraction <= 0) return -1;
+
+                // We don't know design capacity, so we use current_max as a proxy
+                // for full-charge current and estimate capacity as:
+                //   estimated_capacity_µAh ≈ current_max * typical_charge_hours
+                // This is very rough; the charge_full path above is preferred.
+                long effectiveCurrent = (currentMax > 0) ? Math.min(currentMicroA, currentMax)
+                                                         : currentMicroA;
+                // Assume ~2 hours to full at max current as a rough normaliser
+                long estimatedCapacityMicroAh = effectiveCurrent * 2;
+                long remainingMicroAh = (long)(estimatedCapacityMicroAh * remainingFraction);
+                return (remainingMicroAh * 3_600_000L) / currentMicroA;
+            }
+
+        } catch (Throwable t) {
+            Log.w(TAG, "estimateChargingTimeMs: " + t.getMessage());
+        }
+        return -1;
+    }
+
+    /**
+     * Reads a single long integer from a sysfs node.
+     * Returns -1 if the file is missing or unparseable.
+     */
+    private long readSysfsLong(String path) {
+        try (BufferedReader br = new BufferedReader(new FileReader(path))) {
+            String line = br.readLine();
+            if (line != null) return Long.parseLong(line.trim());
+        } catch (FileNotFoundException ignored) {
+        } catch (NumberFormatException | IOException e) {
+            Log.w(TAG, "readSysfsLong(" + path + "): " + e.getMessage());
+        }
+        return -1;
     }
 
     /**
