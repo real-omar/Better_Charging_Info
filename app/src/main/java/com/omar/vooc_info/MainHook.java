@@ -22,13 +22,13 @@ public class MainHook implements IXposedHookLoadPackage {
     // ======================= CONFIG =======================
     /** true: only act when VOOC is detected and show "VOOC Charging".
      *  false: act on any wired charge and show plain "Charging". */
-    private static final boolean SHOW_VOOC_DETECTION = true;
+    private static boolean SHOW_VOOC_DETECTION = true;
     /** Show "4.32 V • 3.33 A • 14.4 W". */
-    private static final boolean SHOW_ELECTRICAL     = true;
+    private static boolean SHOW_ELECTRICAL     = true;
     /** Show "(27m until full)". */
-    private static final boolean SHOW_TIME_ESTIMATE  = true;
+    private static boolean SHOW_TIME_ESTIMATE  = true;
     /** Show battery temperature, e.g. "31.5°C". */
-    private static final boolean SHOW_TEMPERATURE    = true;
+    private static boolean SHOW_TEMPERATURE    = true;
     // ======================================================
 
     private static final String TAG = "VoocChargerHook";
