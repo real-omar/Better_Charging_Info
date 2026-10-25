@@ -9,6 +9,7 @@ import java.io.FileReader;
 import java.io.IOException;
 import java.lang.reflect.Method;
 import java.util.Arrays;
+import java.util.Locale;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -20,6 +21,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "VoocChargerHook";
     private static final String VOOC_NODE = "/sys/class/power_supply/battery/voocchg_ing";
+    private static final String BATT = "/sys/class/power_supply/battery/";
 
     @Override
     public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
@@ -104,9 +106,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 timeRemaining = getLongSafe(kic, "mChargingTimeRemaining", 0);
             }
 
-            String result = (timeRemaining > 0)
-                    ? pct + " \u2022 VOOC Charging (" + formatElapsedTime(ctx, timeRemaining) + " until full)"
-                    : pct + " \u2022 VOOC Charging";
+            String info = buildElectricalInfo();
+            XposedBridge.log(TAG + ": info=" + info);
+            StringBuilder sb = new StringBuilder(pct).append(" \u2022 VOOC Charging");
+            if (info != null) sb.append(" \u2022 ").append(info);
+            if (timeRemaining > 0) {
+                sb.append(" (").append(formatElapsedTime(ctx, timeRemaining)).append(" until full)");
+            }
+            String result = sb.toString();
             XposedBridge.log(TAG + ": result=" + result);
             param.setResult(result);
 
@@ -141,19 +148,45 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
+    /** Returns current in µA (absolute), or -1 if unavailable. Kernel reports mA. */
+    private long readCurrentUa() {
+        long c = readSysfsLong(BATT + "current_now");
+        if (c == -1 || c == 0) return -1;
+        return Math.abs(c) * 1000;   // mA -> µA
+    }
+
+    /** Returns voltage in µV, or -1 if unavailable. Kernel reports µV. */
+    private long readVoltageUv() {
+        long v = readSysfsLong(BATT + "voltage_now");
+        return v > 0 ? v : -1;       // already µV
+    }
+
+    /** "4.32 V • 3.33 A • 14.4 W" or null if we can't read both. */
+    private String buildElectricalInfo() {
+        long ua = readCurrentUa();
+        long uv = readVoltageUv();
+        if (ua <= 0 || uv <= 0) return null;
+        double amps  = ua / 1_000_000.0;
+        double volts = uv / 1_000_000.0;
+        double watts = amps * volts;
+        return String.format(Locale.US, "%.2f V \u2022 %.2f A \u2022 %.1f W", volts, amps, watts);
+    }
+
     private long estimateChargingTimeMs() {
         try {
-            long current = readSysfsLong("/sys/class/power_supply/battery/current_now");
-            if (current == Long.MIN_VALUE || current == 0) return -1;
-            current = Math.abs(current);
-            // Detect units: MTK reports µA (e.g. 2_000_000). Some report mA (e.g. 2000).
-            if (current < 100) return -1;          // < 100 µA — idle
-            if (current < 20_000) current *= 1000; // likely mA → convert to µA
+            long current = readCurrentUa();
+            if (current <= 0) return -1;
 
-            long chargeFull = readSysfsLong("/sys/class/power_supply/battery/charge_full");
-            long chargeNow  = readSysfsLong("/sys/class/power_supply/battery/charge_now");
-            if (chargeFull > 0 && chargeNow > 0 && chargeFull > chargeNow) {
-                long remainingUAh = chargeFull - chargeNow;
+            long full = readSysfsLong(BATT + "charge_full");
+            if (full <= 0) full = readSysfsLong(BATT + "charge_full_design");
+            long now = readSysfsLong(BATT + "charge_now");
+            if (now <= 0 && full > 0) {
+                long cap = readSysfsLong(BATT + "capacity");
+                if (cap >= 0 && cap <= 100) now = full * cap / 100;
+            }
+
+            if (full > 0 && now > 0 && full > now) {
+                long remainingUAh = full - now;
                 return (remainingUAh * 3_600_000L) / current;
             }
         } catch (Throwable t) {
