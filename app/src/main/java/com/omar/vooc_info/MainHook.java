@@ -172,28 +172,29 @@ public class MainHook implements IXposedHookLoadPackage {
         return String.format(Locale.US, "%.2f V \u2022 %.2f A \u2022 %.1f W", volts, amps, watts);
     }
 
-    private long estimateChargingTimeMs() {
-        try {
-            long current = readCurrentUa();
-            if (current <= 0) return -1;
+     private long estimateChargingTimeMs() {
+    try {
+        long current = readCurrentUa();
+        if (current <= 0) return -1;
 
-            long full = readSysfsLong(BATT + "charge_full");
-            if (full <= 0) full = readSysfsLong(BATT + "charge_full_design");
-            long now = readSysfsLong(BATT + "charge_now");
-            if (now <= 0 && full > 0) {
-                long cap = readSysfsLong(BATT + "capacity");
-                if (cap >= 0 && cap <= 100) now = full * cap / 100;
-            }
-
-            if (full > 0 && now > 0 && full > now) {
-                long remainingUAh = full - now;
-                return (remainingUAh * 3_600_000L) / current;
-            }
-        } catch (Throwable t) {
-            Log.w(TAG, "estimateChargingTimeMs: " + t);
+        // Prefer design capacity (reported in µAh on your kernel).
+        long full = readSysfsLong(BATT + "charge_full_design");
+        if (full <= 0) {
+            full = readSysfsLong(BATT + "charge_full");
+            if (full > 0 && full < 100_000) full *= 1000;   // mAh -> µAh
         }
-        return -1;
+
+        // charge_now is broken on this kernel, so derive from capacity %.
+        long cap = readSysfsLong(BATT + "capacity");
+        if (full <= 0 || cap < 0 || cap >= 100) return -1;
+
+        long remainingUAh = full * (100 - cap) / 100;
+        return (remainingUAh * 3_600_000L) / current;
+    } catch (Throwable t) {
+        Log.w(TAG, "estimateChargingTimeMs: " + t);
     }
+    return -1;
+}
 
     private long readSysfsLong(String path) {
         try (BufferedReader br = new BufferedReader(new FileReader(path))) {
