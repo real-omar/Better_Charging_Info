@@ -19,6 +19,18 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 
 public class MainHook implements IXposedHookLoadPackage {
 
+    // ======================= CONFIG =======================
+    /** true: only act when VOOC is detected and show "VOOC Charging".
+     *  false: act on any wired charge and show plain "Charging". */
+    private static final boolean SHOW_VOOC_DETECTION = true;
+    /** Show "4.32 V • 3.33 A • 14.4 W". */
+    private static final boolean SHOW_ELECTRICAL     = true;
+    /** Show "(27m until full)". */
+    private static final boolean SHOW_TIME_ESTIMATE  = true;
+    /** Show battery temperature, e.g. "31.5°C". */
+    private static final boolean SHOW_TEMPERATURE    = true;
+    // ======================================================
+
     private static final String TAG = "VoocChargerHook";
     private static final String VOOC_NODE = "/sys/class/power_supply/battery/voocchg_ing";
     private static final String BATT = "/sys/class/power_supply/battery/";
@@ -90,29 +102,45 @@ public class MainHook implements IXposedHookLoadPackage {
                 return;
             }
 
-            boolean vooc = isVoocCharger();
-            XposedBridge.log(TAG + ": vooc=" + vooc);
-            if (!vooc) return;
+            if (SHOW_VOOC_DETECTION) {
+                boolean vooc = isVoocCharger();
+                XposedBridge.log(TAG + ": vooc=" + vooc);
+                if (!vooc) return;
+            }
 
             Context ctx = (Context) XposedHelpers.getObjectField(kic, "mContext");
             int level = getIntSafe(kic, "mBatteryLevel", -1);
             XposedBridge.log(TAG + ": level=" + level);
             if (level < 0 || level > 100) return;
-            String pct = level + "%";
 
-            long timeRemaining = estimateChargingTimeMs();
-            XposedBridge.log(TAG + ": estMs=" + timeRemaining);
-            if (timeRemaining <= 0) {
-                timeRemaining = getLongSafe(kic, "mChargingTimeRemaining", 0);
+            StringBuilder sb = new StringBuilder();
+            sb.append(level).append("%");
+            sb.append(" \u2022 ").append(SHOW_VOOC_DETECTION ? "VOOC Charging" : "Charging");
+
+            if (SHOW_ELECTRICAL) {
+                String info = buildElectricalInfo();
+                XposedBridge.log(TAG + ": info=" + info);
+                if (info != null) sb.append(" \u2022 ").append(info);
             }
 
-            String info = buildElectricalInfo();
-            XposedBridge.log(TAG + ": info=" + info);
-            StringBuilder sb = new StringBuilder(pct).append(" \u2022 VOOC Charging");
-            if (info != null) sb.append(" \u2022 ").append(info);
-            if (timeRemaining > 0) {
-                sb.append(" (").append(formatElapsedTime(ctx, timeRemaining)).append(" until full)");
+            if (SHOW_TEMPERATURE) {
+                String temp = buildTemperature();
+                XposedBridge.log(TAG + ": temp=" + temp);
+                if (temp != null) sb.append(" \u2022 ").append(temp);
             }
+
+            if (SHOW_TIME_ESTIMATE) {
+                long timeRemaining = estimateChargingTimeMs();
+                XposedBridge.log(TAG + ": estMs=" + timeRemaining);
+                if (timeRemaining <= 0) {
+                    timeRemaining = getLongSafe(kic, "mChargingTimeRemaining", 0);
+                }
+                if (timeRemaining > 0) {
+                    sb.append(" (").append(formatElapsedTime(ctx, timeRemaining))
+                      .append(" until full)");
+                }
+            }
+
             String result = sb.toString();
             XposedBridge.log(TAG + ": result=" + result);
             param.setResult(result);
@@ -172,29 +200,46 @@ public class MainHook implements IXposedHookLoadPackage {
         return String.format(Locale.US, "%.2f V \u2022 %.2f A \u2022 %.1f W", volts, amps, watts);
     }
 
-     private long estimateChargingTimeMs() {
-    try {
-        long current = readCurrentUa();
-        if (current <= 0) return -1;
-
-        // Prefer design capacity (reported in µAh on your kernel).
-        long full = readSysfsLong(BATT + "charge_full_design");
-        if (full <= 0) {
-            full = readSysfsLong(BATT + "charge_full");
-            if (full > 0 && full < 100_000) full *= 1000;   // mAh -> µAh
+    /** "31.5°C" or null. The power_supply ABI reports tenths of °C (315 = 31.5°C). */
+    private String buildTemperature() {
+        long raw = readSysfsLong(BATT + "temp");
+        if (raw == -1) {
+            // temp can legitimately be negative, but -1 also means "unreadable";
+            // a real -0.1°C reading is not worth distinguishing here.
+            return null;
         }
-
-        // charge_now is broken on this kernel, so derive from capacity %.
-        long cap = readSysfsLong(BATT + "capacity");
-        if (full <= 0 || cap < 0 || cap >= 100) return -1;
-
-        long remainingUAh = full * (100 - cap) / 100;
-        return (remainingUAh * 3_600_000L) / current;
-    } catch (Throwable t) {
-        Log.w(TAG, "estimateChargingTimeMs: " + t);
+        double celsius;
+        if (Math.abs(raw) >= 1000) {
+            celsius = raw / 1000.0;   // some kernels report millidegrees
+        } else {
+            celsius = raw / 10.0;     // standard: tenths of a degree
+        }
+        return String.format(Locale.US, "%.1f\u00B0C", celsius);
     }
-    return -1;
-}
+
+    private long estimateChargingTimeMs() {
+        try {
+            long current = readCurrentUa();
+            if (current <= 0) return -1;
+
+            // Prefer design capacity (reported in µAh on this kernel).
+            long full = readSysfsLong(BATT + "charge_full_design");
+            if (full <= 0) {
+                full = readSysfsLong(BATT + "charge_full");
+                if (full > 0 && full < 100_000) full *= 1000;   // mAh -> µAh
+            }
+
+            // charge_now is broken on this kernel, so derive from capacity %.
+            long cap = readSysfsLong(BATT + "capacity");
+            if (full <= 0 || cap < 0 || cap >= 100) return -1;
+
+            long remainingUAh = full * (100 - cap) / 100;
+            return (remainingUAh * 3_600_000L) / current;
+        } catch (Throwable t) {
+            Log.w(TAG, "estimateChargingTimeMs: " + t);
+        }
+        return -1;
+    }
 
     private long readSysfsLong(String path) {
         try (BufferedReader br = new BufferedReader(new FileReader(path))) {
